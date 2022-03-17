@@ -1,6 +1,6 @@
 let axios = require('axios');
-let mysql = require('mysql');
-let xmlJs = require('xml-js');
+let pg = require('pg');
+let limit = 200;
 require('dotenv').config();
 
 // get all months in date range
@@ -27,68 +27,98 @@ let verbose = process.argv.includes('--verbose') || process.argv.includes('-v');
 
 // get from and to dates
 let from = process.env.DATE_FROM;
-let cur = new Date();
-cur.setMonth(cur.getMonth() + 1);
-let to = cur.toISOString().split('T')[0];
+let to = process.env.DATE_TO;
+//let cur = new Date();
+//cur.setMonth(cur.getMonth() + 1);
+//let to = cur.toISOString().split('T')[0];
 let dates = dateRange(from, to);
 dates[0] = from;
+if (dates[dates.length -1] != to || from == to)
+    dates[dates.length] = to;
 let promises = [];
+
+function getWorklogs(i, offset, data = [])
+{
+    return axios.get(
+        'https://api.tempo.io/core/3/worklogs?limit=' + limit + '&from=' + dates[i] + '&to=' + dates[i + 1] + (offset ? '&offset=' + offset : ''),
+        {headers: {'Authorization': 'Bearer ' + process.env.BEARER_TOKEN}}
+    ).then(response =>
+    {
+	if (response.data.metadata.offset && response.data.results.length < 1)
+            return data;
+        data.push(response);
+        if (response.data.results.length < 1 || response.data.metadata.count < limit)
+            return data;
+        return getWorklogs(i, response.data.metadata.offset + limit, data);
+    });
+}
 
 // create Tempo API requests promises
 for (let i = 0; i < dates.length - 1; i++) {
-    promises.push(axios.get('https://app.tempo.io/api/1/getWorklog?dateFrom=' + dates[i] + '&dateTo=' + dates[i + 1] + '&format=xml&baseUrl=' + process.env.BASE_URL + '&tempoApiToken=' + process.env.TEMPO_API_TOKEN));
+    promises.push(getWorklogs(i));
 }
 
 // run all requests at once
-Promise.all(promises).then((values) => {
+Promise.all(promises).then(valuess => {
     let logs = [];
-    // parse XML
-    for (let value of values) {
-        let response = JSON.parse(xmlJs.xml2json(value.data, {compact: true, spaces: 4}));
-        let worklog = response.worklogs.worklog;
-        if (Array.isArray(worklog)) {
-            logs = logs.concat(response.worklogs.worklog);
+    for (let values of valuess) {
+        for (let value of values) {
+            let worklog = value.data.results;
+            if (Array.isArray(worklog)) {
+                logs = logs.concat(worklog);
+            }
         }
     }
 
     // connect to DB
-    let con = mysql.createConnection({
-        host: process.env.DB_HOST,
-        user: process.env.DB_USER,
-        password: process.env.DB_PASS
-    });
+    // The default env:
+    // PGHOST='localhost'
+    // PGUSER=process.env.USER
+    // PGDATABASE=process.env.USER
+    // PGPASSWORD=null
+    // PGPORT=5432
+    let client = new pg.Client();
+    let queries = [];
+    client.connect(err =>
+    {
+        if (err)
+            throw new Error(err);
 
-    con.connect(function (err) {
-        if (err) throw err;
-        if (verbose) console.log("Connected!");
+        if (verbose)
+            console.log("Connected!");
 
         let corruptedUsernamesCount = 0;
         let corruptedJiraIdsCount = 0;
 
         for (let log of logs) {
             // run SQL UPDATE for each worklog
-            if (typeof log.username === 'undefined') {
+            if (typeof log.author === 'undefined' || typeof log.author.accountId === 'undefined') {
                 corruptedUsernamesCount++;
                 continue;
             }
-            let user = log.username._text;
-            if (typeof log.jira_worklog_id === 'undefined') {
+            let userId = log.author.accountId;
+            let user = "(SELECT user_key FROM cwd_user cwu, app_user au WHERE cwu.lower_user_name = au.lower_user_name AND external_id = '" + userId + "')";
+            if (typeof log.jiraWorklogId === 'undefined') {
                 corruptedJiraIdsCount++;
                 continue;
             }
-            let jiraId = log.jira_worklog_id._text;
-            let sql = 'UPDATE ' + process.env.DB_NAME + '.worklog SET AUTHOR = "' + user + '", UPDATEAUTHOR = "' + user + '" WHERE ID = "' + jiraId + '"';
-            con.query(sql, function (err) {
-                if (err) {
-                    console.log('Error while processiong this command: ' + sql);
-                    throw err;
-                }
-                if (verbose) console.log(sql + ' => DONE');
-            });
+            let jiraId = log.jiraWorklogId;
+            let sql = 'UPDATE worklog SET author = ' + user + ', updateauthor = ' + user + ' WHERE ID = \'' + jiraId + '\'';
+            queries.push(client.query(sql)
+                .then(() => console.log(verbose ? "Query: " + sql + " Done!" : "."))
+                .catch(e => console.log('Error while processiong this command: ' + sql + '\nThe error: ' + e.message))
+                .then(() => {return Promise.resolve();})
+            );
         }
-
-        console.log('jira_worklog_id missing count: ' + corruptedJiraIdsCount);
-        console.log('username missing count: ' + corruptedUsernamesCount);
-        con.end();
+        Promise.all(queries).then(() => client.end().then(() =>
+           {
+               console.log('------------------------------------');
+               console.log('jira_worklog_id missing count: ' + corruptedJiraIdsCount);
+               console.log('username missing count: ' + corruptedUsernamesCount);
+               if (verbose)
+                   console.log('Connection closed.');
+           }
+        ));
     });
+    //await client.end().then(() => console.log('Connection closed.'))
 });
